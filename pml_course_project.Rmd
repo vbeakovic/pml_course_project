@@ -1,0 +1,202 @@
+---
+title: 'Practical Machine Learning: Predicting Quality of Exercise'
+author: "Valter Beaković"
+date: "April 17, 2016"
+output:
+  html_document:
+    keep_md: yes
+  pdf_document: default
+  word_document: default
+---
+#### **Note**
+**Use rmarkdown::render("pml_course_project.Rmd") to knit the md and html files when reproducing the research!**
+
+Set locale to English (default is Croatian on the PC used to produce the document)
+```{r set_locale, message=FALSE, results='hide'}
+Sys.setlocale("LC_ALL", "en_GB.UTF-8")
+```
+The R code uses functions from various libraries. The code bellow installs and loads the 
+required libraries.
+```{r libraries, message=FALSE}
+packages <- c("ggplot2", "dplyr", "caret", "randomForest")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(randomForest)
+```
+
+
+## Loading the data
+
+The data used for the research comes from sensors in the users’ glove, armband, lumbar belt and
+dumbbell. The datasets are is in the ./data folder stored as csv files.
+
+The first step is to extract the csv file containing the activitiy data from the
+archive.
+
+The code bellow loads the training and testing activity data into a data frame:
+```{r load_data}
+# training data
+if (file.exists("./files/pml-training.csv")) {
+        training <- read.csv("./files/pml-training.csv")                
+}
+# testing data
+if (file.exists("./files/pml-testing.csv")) {
+        testing <- read.csv("./files/pml-testing.csv")                
+}
+```
+
+## Cleaning the data
+
+The training dataset cointains `r NROW(training)` observations and `r ncol(training)` variables while the testing dataset has `r NROW(testing)` observations and the same number of variables. 
+
+A look at the structure of the data set show that many variables are mostly NA's:
+```{r data_structure, eval=FALSE}
+# result not printed to save space.
+str(training)
+```
+
+The following code identifies and removes the mostly NA variables:
+```{r remove_na}
+# remove variables with mostly NA's with a treshold of 95%
+training <- training[ , colSums(is.na(training)) < nrow(training)*0.95]
+```
+
+In total 67 varibles has been removed consiting of mostly NA's. 
+Next we'll identify Zero and Near Zero Variance predictors and remove them from the dataset:
+The following code identifies and removes the mostly NA variables:
+```{r remove_znz}
+# remove Zero and Near Zero Variance predictors
+training <- training[ , -(nearZeroVar(training))]
+```
+
+In total `r 93 - ncol(training)` varibles has been removed being Zero and Near Zero Variance predictors. The documentation of the Caret package explains the motivation to remove those variables:
+
+The concern here that these predictors may become zero-variance predictors when the data are split into cross-validation/bootstrap sub-samples or that a few samples may have an undue influence on the model. These "near-zero-variance" predictors may need to be identified and eliminated prior to modeling. 
+
+Additionally the first 6 columns will be removed since those columns will not be included in modeling.
+```{r remove16}
+training <- training[ , -c(1:6)]
+```
+
+## Creating the training and validation dataset
+
+The training dataset will be split in a training and validation data set. The validation data set will be used to estimate the out of sample error.
+```{r partition}
+# creat training and validation dataset
+set.seed(777)
+inTrain <- createDataPartition(y=training$classe, p=0.8, list=F)
+training.train <- training[inTrain, ]
+training.validate <- training[-inTrain, ]
+```
+
+## Data exploration
+
+```{r explore}
+# table of observation by class
+table(training.train$classe)
+```
+
+The correct exercice (class A) has most observation while the rest of the classes has similar number of observations. 
+
+Next a look at correlations:
+```{r cors}
+# find correlated variables
+corr <- cor(training.train[, -which(names(training.train) %in% c("classe"))])
+findCorrelation(corr, cutoff = .90, verbose = FALSE,
+                names = TRUE, exact = ncol(corr) < 100)
+```
+
+We have 7 highly correlated variables. Later will see it the variables make it to the top 10 most important variables.
+
+## Modeling
+
+The original study used Random Forest with Leave one out cross-validation. I'll stick with Random forest but switch to 3-fold cross-valdation for performance reasons:
+
+```{r rf1, fig.path='./figures/'}
+# model Random forest to detect most important variables
+set.seed(777)
+rf.mod <- randomForest(classe ~ ., 
+                       data = training.train, 
+                       ntree = 600, 
+                       importance = TRUE)
+# Get importance
+importance    <- importance(rf.mod)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+# Create a rank variable based on importance
+rankImportance <- varImportance %>%
+        mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+                           y = Importance)) +
+        geom_bar(stat='identity', colour = 'black') +
+        geom_text(aes(x = Variables, y = 0.5, label = Rank),
+                  hjust=0, vjust=0.55, size = 4, colour = 'lavender',
+                  fontface = 'bold') +
+        labs(x = 'Variables', title = 'Relative Variable Importance') +
+        coord_flip() 
+```
+
+Let's try to model with only 10 variables. The correlated variables did not emerge in the top 10, we'll use just "roll_belt":
+
+```{r rf_caret}
+# top 10 variables
+set.seed(777)
+vars <- c( "roll_belt", "yaw_belt", "pitch_forearm", "magnet_dumbbell_z",   
+          "pitch_belt", "magnet_dumbbell_y", "roll_forearm", "magnet_dumbbell_x", 
+          "roll_dumbbell", "accel_dumbbell_y")
+# train control
+train.param <- trainControl(method="cv", number=3, verboseIter=F)
+# train random forest model
+predictors = paste(vars, collapse="+") 
+fml = as.formula(sprintf('%s ~ %s', "classe", predictors))
+fit.model <- train(fml, data=training.train, method="rf", trControl=train.param)
+# print the final model
+fit.model$finalModel
+```
+
+Estimating the training set error:
+```{r in_sample_error}
+# predict
+preds.train <- predict(fit.model)
+# show confusion matrix to get estimate of in-sample error
+conf.matrix.train <- confusionMatrix(training.train$classe, preds.train)
+conf.matrix.train
+# in sample error
+in.sample.error <- 1 - conf.matrix.train$overall[1]
+names(in.sample.error) <- "Training set error"
+in.sample.error
+```
+
+On the training set the accuracy is 100%.
+The final model with 10 predictors looks well, let's see how he model does on the validation set:
+
+```{r predict}
+# predict
+preds.validate <- predict(fit.model, newdata=training.validate)
+# show confusion matrix to get estimate of out-of-sample error
+conf.matrix.validate <- confusionMatrix(training.validate$classe, preds.validate)
+conf.matrix.validate
+```
+
+Estimation of the out of sample error:
+
+```{r out_sample_error}
+# calculating the out of sample error
+out.sample.error <- 1 - conf.matrix.validate$overall[1]
+names(out.sample.error) <- "Out of sample error"
+out.sample.error
+```
+
+The out of sample error is `r paste(round(out.sample.error *100, 2), "%", sep = " ")`. Considering that not many models were tested and even the Random forest model was not tested with different train parameters the result is satisfactory.
+
+## Conclusion
+
+A quick and simple modeling based on 10 most important variables estimated with the Random forest algorithm produced accurate results. It would be interesting to explore further combinations of variables and models and maybe get an even simpler model with satisfatory accuracy. The used model scored 100% on the course prediction quiz.
+
+
